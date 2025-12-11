@@ -1,0 +1,4 @@
+zab.connection.com {
+    encode gzip
+    reverse_proxy asterisk-monitor-api:8082
+}

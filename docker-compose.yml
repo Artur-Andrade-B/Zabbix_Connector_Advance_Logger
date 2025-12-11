@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    container_name: asterisk-monitor-api
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "8082:8082"     # host:container
+
+    volumes:
+      - ./spool:/var/spool/asterisk-zbx
