@@ -6,7 +6,8 @@ import socket
 import threading
 import traceback
 import re
-from queue import Queue, Empty
+import atexit
+from queue import Queue, Empty, Full
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -84,6 +85,105 @@ LOG_LEVEL_COLORS = {
     "WARNING": Fore.YELLOW,
     "ERROR":   Fore.RED,
 }
+class DailyTerminalLog:
+    """
+    Writes every terminal line (both logger lines and JSON event lines) to a daily .log file.
+    Filename: logs_dd_mm_yy.log
+    """
+    def __init__(self, directory: Path, prefix: str = "logs"):
+        self.dir = directory
+        self.prefix = prefix
+        self.lock = threading.Lock()
+        self.fp = None
+        self.day = None
+        self._last_err = None
+
+    def path_for(self, dt: Optional[datetime] = None) -> Path:
+        dt = dt or datetime.now(TZ)
+        return self.dir / f"{self.prefix}_{dt:%d_%m_%y}.log"
+
+    def _ensure_open_locked(self) -> None:
+        dt = datetime.now(TZ)
+        d = dt.date()
+        if self.fp is not None and self.day == d:
+            return
+
+        try:
+            if self.fp:
+                self.fp.close()
+        except Exception:
+            pass
+
+        p = self.path_for(dt)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            self.fp = open(p, "a", encoding="utf-8", buffering=1)
+            self.day = d
+            self._last_err = None
+        except Exception as e:
+            msg = f"[TERMLOG] cannot open {p}: {e}\n"
+            if msg != self._last_err:
+                self._last_err = msg
+                try:
+                    sys.__stderr__.write(msg)
+                    sys.__stderr__.flush()
+                except Exception:
+                    pass
+            self.fp = None
+            self.day = d
+
+    def touch(self) -> None:
+        with self.lock:
+            self._ensure_open_locked()
+            if self.fp:
+                try:
+                    self.fp.flush()
+                except Exception:
+                    pass
+
+    def write(self, text: str) -> None:
+        if not text:
+            return
+        with self.lock:
+            self._ensure_open_locked()
+            if not self.fp:
+                return
+            try:
+                self.fp.write(text)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        with self.lock:
+            try:
+                if self.fp:
+                    self.fp.close()
+            except Exception:
+                pass
+            self.fp = None
+            self.day = None
+
+TERMLOG = DailyTerminalLog(SPOOL_PATH.parent, prefix=os.getenv("TERMLOG_PREFIX", "logs"))
+atexit.register(TERMLOG.close)
+
+def terminal_log_path_now() -> Path:
+    return TERMLOG.path_for(datetime.now(TZ))
+
+def mirror_terminal_line(text: str) -> None:
+    TERMLOG.write(text)
+
+def term_write(text: str, flush: bool = True, mirror: bool = True) -> None:
+    """
+    Write to stdout and mirror to daily log (exact same text).
+    """
+    try:
+        sys.stdout.write(text)
+        if flush:
+            sys.stdout.flush()
+    except Exception:
+        pass
+    if mirror:
+        mirror_terminal_line(text)
 
 class ThreadLogger(threading.Thread):
     def __init__(self):
@@ -107,8 +207,7 @@ class ThreadLogger(threading.Thread):
             color = LOG_LEVEL_COLORS.get(level, "")
             line = f"{color}[{level}] {src}: {msg}{Style.RESET_ALL}\n"
             try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+                term_write(line, flush=True, mirror=True)
             except Exception:
                 pass
 
@@ -422,13 +521,23 @@ class SFTPTailer:
     def _reconnect_with_backoff(self):
         start = time.time()
         while True:
+            # If cooldown is active, stop reconnect loop immediately.
+            if cooldown_start.is_set():
+                raise RuntimeError("cooldown_in_progress")
+
             try:
                 self.connect()
                 return
             except Exception as e:
                 log_err("collector", f"SFTP reconnect failed: {e}")
+
+                # If cooldown started while we were failing, stop immediately.
+                if cooldown_start.is_set():
+                    raise RuntimeError("cooldown_in_progress")
+
                 time.sleep(self.backoff_ms / 1000.0)
                 self.backoff_ms = min(self.backoff_ms * 2, ENV["MAX_RECONNECT_BACKOFF_MS"])
+
                 if time.time() - start > 5:
                     ev = build_simple_event("asterisk.collector.source_down", 1)
                     EMITTER.emit(ev)
@@ -899,6 +1008,11 @@ class ParserWorker(threading.Thread):
         try:
             tailer._reconnect_with_backoff()
         except Exception as e:
+            if str(e) == "cooldown_in_progress":
+                log_warn("collector", f"cycle {self.cycle_id} initial connect aborted (cooldown in progress)")
+                hb_update("idle", self.cycle_id)
+                return
+
             log_err("collector", f"cycle {self.cycle_id} initial connect failed: {e}\n{traceback.format_exc()}")
             hb_update("error", self.cycle_id)
             cooldown_start.set()
@@ -966,6 +1080,7 @@ class ParserWorker(threading.Thread):
                 except Exception as e2:
                     log_err("collector", f"cycle {self.cycle_id} reconnect failed: {e2}\n{traceback.format_exc()}")
                     hb_update("error", self.cycle_id)
+                    cooldown_start.set()
                     break
 
             time.sleep(poll_interval)
@@ -987,7 +1102,6 @@ class CooldownWorker(threading.Thread):
     def run(self):
         while True:
             cooldown_start.wait()
-            cooldown_start.clear()
 
             log_notice("cooldown", f"starting cooldown {COOLDOWN_SEC}s")
             for remaining in range(COOLDOWN_SEC, 0, -1):
@@ -1007,6 +1121,7 @@ class CooldownWorker(threading.Thread):
                 pass
 
             log_notice("cooldown", "cooldown finished")
+            cooldown_start.clear()
             scheduler_request_new_cycle()
 
 #################################
@@ -1016,10 +1131,19 @@ SCHED_LOCK = threading.Lock()
 SCHED_STATE = {
     "cycle_id": 0,
     "active_thread": None,
+    "counter":0,
 }
+def clear_screen():
+    import subprocess
+    command = 'cls' if os.name == 'nt' else 'clear'
+    subprocess.run([command], shell=True)
 
 def scheduler_request_new_cycle():
     with SCHED_LOCK:
+        if SCHED_STATE["counter"] >= 10:
+            clear_screen()
+            SCHED_STATE["counter"] = 0
+        SCHED_STATE["counter"] += 1
         SCHED_STATE["cycle_id"] += 1
         cid = SCHED_STATE["cycle_id"]
         pw = ParserWorker(cycle_id=cid)
@@ -1052,6 +1176,7 @@ class SchedulerThread(threading.Thread):
                 log_err("scheduler", f"collector[{cid}] stalled. abandoning and forcing cooldown")
                 cooldown_start.set()
                 hb_update("error", cid)
+
 
 #################################
 # API auth helper
